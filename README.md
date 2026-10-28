@@ -1,6 +1,6 @@
-# Draft persistence API
+# Course persistence and publication API
 
-Milestone 3 service: Python standard library HTTP adapter, independent layout validation, and transactional SQLite. This uses the design's optional stack choice to avoid third-party deployment dependencies. Run one service process behind your existing HTTPS reverse proxy. Domain and deployment remain owner-configured; nothing has been published or connected to a live account.
+Milestones 3–4 service: Python standard library HTTP adapter, independent layout validation, transactional SQLite, verification/publication, discovery, visits/preferences, and local moderation tools. Run one service process behind your existing HTTPS reverse proxy. The owner has confirmed live draft saving. The new publication flow needs the deployment and Creator checks in [PUBLICATION_PLAYTEST.md](../PUBLICATION_PLAYTEST.md). Deploy the complete API source directory, including migration 2 and `publication.py`; preserve the production database and `.env`.
 
 ## Configure and run
 
@@ -27,12 +27,26 @@ The service limits requests to 120/minute per authorization/IP budget and regist
 
 ## Connect the game
 
+For this workspace's configured API at `https://obbybuilder.minimapper.net`, an authenticated HTTPS registration/heartbeat/close handshake has passed. The owner-supplied values were moved from `.env.example` into ignored `site-api/.env`, and the example was restored to empty placeholders. To generate a connected development project without embedding credentials in the shared preview, run:
+
+```sh
+python3 tools/build_world.py --connect-local
+```
+
+Open **`game/persistence-connected.local.ptproj`** or load **`persistence-connected.local.poly`** explicitly. These ignored, owner-readable files contain a server-only `ApiBootstrapSecret` and `ApiConnection` under ServerHidden. The normal source configuration remains disabled; the private connection object enables it for this world. For Creator local tests it uses the configured API game ID, while a deployed server still asserts its actual `world.WorldID`. Do not publish or commit the private artifact. Regenerate it after changing the private environment. No manual attachment or value creation is needed for this development build.
+
+Live requests require an explicit client User-Agent through the current upstream proxy; the adapter sends `ObbyCreator-GameServer/1.0`. The owner confirmed game-to-API saving and the corrected Saved display. Client-side ServerHidden isolation remains a deployment check. If the whole server is stopped before cleanup, a lease can remain held until its 180-second expiry.
+
+The following manual steps describe a separate production deployment or generic configuration:
+
 1. Open **`game/persistence-preview.ptproj`** (or `persistence-preview.poly`) in Creator. It includes the new server-only modules and worker. Existing runner/editor preview worlds remain available.
 2. Leave `PersistenceConfig.enabled=false` while verifying the HTTPS JSON/header round trip with the existing HTTP probe. The game continues to show **Session-only**.
 3. Verify in the actual target client that `ServerHidden` contents and linked server-only configuration are unavailable to clients. The supplied API documents that ServerHidden is not replicated, but distribution/source access must also be checked before provisioning a real credential. The project does not invent an environment-variable or secret-manager API for Polytoria.
 4. Provision a server-only **StringValue** named **ApiBootstrapSecret** under **ServerHidden** using your supported private deployment mechanism. Its Value must match `OBBY_BOOTSTRAP_SECRET`. No real value is included in the generated world. Do not commit a world file containing this value.
 5. In `game/scripts/server/PersistenceConfig.luau`, set `baseURL` to the HTTPS API base, without `/v1`, and set `enabled=true`. The bootstrap game ID must match `world.WorldID`. For an explicit local-only experiment, `allowLocalHTTP=true` permits `http://127.0.0.1:PORT` only when `world.IsLocalTest` is true.
-6. Restart Play. Click **My Courses / Build**. The server registers, opens trusted player presence, loads account quantities/five slots, acquires a lease, and fetches the selected draft. Save and Reload buttons appear once persistence is active. Initial connection can take several seconds because calls are globally serialized and spaced by 1.5 seconds.
+6. Restart Play. On player join, the server registers, opens trusted player presence, and preloads account quantities and all five saved drafts. Click **My Courses / Build** to acquire the selected slot's edit lease. The lease response checks the cached revision; an unchanged draft opens from memory, while a changed draft is fetched again. Save and Reload buttons appear once persistence is active. Joining and immediately opening the editor can still wait for the startup requests because calls are globally serialized and spaced by 1.5 seconds.
+
+Deploy the complete updated API source directory and restart `obby-api` for preload plus publication/discovery. Startup applies migration 2; no environment change is needed. The bootstrap endpoint accepts `include_drafts=1`, and edit-lease responses include `draft_revision`. Preloading also works with the older API, but publication/discovery require the new API. Restart Play to load linked script changes; no world rebuild is required. Creator prints `[Obby persistence] Player slots preloaded` when startup loading completes. Preloading does not acquire edit leases; leaving without opening the editor still closes player presence.
 
 This is ready for integration once the URL, transport, and credential-isolation gates are satisfied. Until then, durable saving remains disabled rather than claiming edits are stored.
 
@@ -57,10 +71,18 @@ Heartbeats renew a 180-second server lease approximately every 60 seconds with j
 | POST / DELETE | `/v1/slots/{id}/edit-lease` |
 | GET | `/v1/slots/{id}/draft?presence_id=...` |
 | PUT | `/v1/slots/{id}/draft` |
+| POST | `/v1/slots/{id}/verification-runs` |
+| POST | `/v1/verification-runs/{id}/finish` |
+| POST | `/v1/slots/{id}/publish` |
+| GET | `/v1/courses` / `/v1/courses/{id}` / `/v1/course-versions/{id}` |
+| POST | `/v1/courses/{id}/unpublish` |
+| POST | `/v1/runs` / `/v1/runs/{id}/finish` |
+| PUT | `/v1/courses/{id}/vote` / `/v1/courses/{id}/favourite` |
+| POST | `/v1/courses/{id}/reports` |
 
 Registration uses the bootstrap credential in its bearer header and `{game_id, protocol_version:1, display_name}`. Other routes use the issued per-server token. Lease operations carry `presence_id`; DELETE also carries `lease_id`. Draft PUT carries `{presence_id, lease_id, expected_revision, request_id, layout}`. The layout has schema/rules version 1, fixed start, parts, and checkpoint order. Responses use numeric UTC Unix timestamps. Error envelopes are `{code,message}`.
 
-The API independently validates stock per slot, object count, field/type allowlists, finite transforms/colours, rotated bounds, entrance exclusion, and checkpoint ordering. It normalizes Luau's empty-table ambiguity only for empty part/order arrays and empty property objects; nonempty wrong container types are rejected. Canonical layout hashing sorts stable part IDs/keys and normalizes integral floats. Courses and public IDs are stable, but publication, discovery, moderation, catalogue purchases, verified entitlements, and currency rewards are not implemented in this milestone.
+The API independently validates stock per slot, object count, field/type allowlists, finite transforms/colours, rotated bounds, entrance exclusion, and checkpoint ordering. It normalizes Luau's empty-table ambiguity only for empty part/order arrays and empty property objects; nonempty wrong container types are rejected. Canonical layout hashing sorts stable part IDs/keys and normalizes integral floats. Each slot retains one stable public ID across publications, with immutable versions. Catalogue purchases, verified entitlements, and currency rewards remain later milestones. See the publication playtest guide for proof, discovery, and moderation details.
 
 ## Backup, retention, and restore
 

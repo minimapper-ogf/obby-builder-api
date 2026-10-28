@@ -27,6 +27,8 @@ def maintain(database):
     cutoff = time.time()-7*86400
     with sqlite3.connect(database) as db:
         db.execute("PRAGMA foreign_keys=ON")
+        if db.execute("PRAGMA user_version").fetchone()[0] >= 2:
+            db.execute("DELETE FROM discovery_cursors WHERE expires_at<?", (time.time(),))
         db.execute("DELETE FROM edit_leases WHERE expires_at<?", (time.time(),))
         db.execute("DELETE FROM idempotency_records WHERE created_at<?", (cutoff,))
         db.execute("DELETE FROM player_sessions WHERE server_id IN (SELECT id FROM server_sessions WHERE absolute_expiry<?)", (cutoff,))

@@ -34,11 +34,12 @@ class Service:
         self.database, self.secrets, self.game_id, self.clock = str(database), bootstrap_secrets, game_id, clock
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version == 0:
-                migration = (Path(__file__).parent / "migrations/001_persistence.sql").read_text()
-                db.executescript("BEGIN IMMEDIATE;\n" + migration + "\nPRAGMA user_version=1; COMMIT;")
-            elif version != 1:
+            if version > 2:
                 raise RuntimeError("Unsupported database schema version")
+            for target, filename in ((1, "001_persistence.sql"), (2, "002_publication.sql")):
+                if version < target:
+                    migration = (Path(__file__).parent / "migrations" / filename).read_text()
+                    db.executescript("BEGIN IMMEDIATE;\n" + migration + f"\nPRAGMA user_version={target}; COMMIT;")
 
     @contextmanager
     def connect(self):
@@ -83,7 +84,11 @@ class Service:
             fail(403, "slot_owner", "This course slot is unavailable")
         return row
 
-    def bootstrap(self, db, player_id, now):
+    def draft_payload(self, db, slot, draft):
+        verified = db.execute("SELECT id FROM verification_runs WHERE slot_id=? AND revision=? AND content_hash=? AND rules_version=1 AND finished_at IS NOT NULL ORDER BY finished_at DESC,id LIMIT 1", (slot["id"], draft["revision"], draft["content_hash"])).fetchone()
+        return dict(course_id=slot["course_id"], revision=draft["revision"], layout=json.loads(draft["layout_json"]), content_hash=draft["content_hash"], updated_at=draft["updated_at"], verification_id=verified["id"] if verified else None)
+
+    def bootstrap(self, db, player_id, now, include_drafts=False):
         if not db.execute("SELECT 1 FROM players WHERE id=?", (player_id,)).fetchone():
             db.execute("INSERT INTO players VALUES(?,?)", (player_id, now))
             db.execute("INSERT INTO wallets VALUES(?,0)", (player_id,))
@@ -95,7 +100,11 @@ class Service:
                 layout = initial_layout()
                 db.execute("INSERT INTO drafts VALUES(?,?,0,?,?)", (slot_id, canonical(layout), content_hash(layout), now))
         stock = dict(db.execute("SELECT piece_type,quantity FROM inventory WHERE player_id=?", (player_id,)).fetchall())
-        slots = [dict(row) for row in db.execute("SELECT s.id,s.slot_index,s.course_id,c.title,d.revision,d.updated_at FROM slots s JOIN courses c ON c.id=s.course_id JOIN drafts d ON d.slot_id=s.id WHERE s.owner_id=? ORDER BY s.slot_index", (player_id,))]
+        slots = [dict(row) for row in db.execute("SELECT s.id,s.slot_index,s.course_id,c.title,c.description,c.current_published_version,c.visibility,d.revision,d.updated_at FROM slots s JOIN courses c ON c.id=s.course_id JOIN drafts d ON d.slot_id=s.id WHERE s.owner_id=? ORDER BY s.slot_index", (player_id,))]
+        if include_drafts:
+            for slot in slots:
+                draft = db.execute("SELECT * FROM drafts WHERE slot_id=?", (slot["id"],)).fetchone()
+                slot["draft"] = self.draft_payload(db, slot, draft)
         return dict(player_id=player_id, inventory=stock, balance=db.execute("SELECT balance FROM wallets WHERE player_id=?", (player_id,)).fetchone()[0],
                     slots=slots, object_limit=150, entitlements=[], schema_version=1, rules_version=1)
 
@@ -109,7 +118,7 @@ class Service:
         query = parse_qs(url.query)
         now = self.clock()
         if method == "GET" and path == "/health":
-            return {"ok": True, "schema_version": 1}
+            return {"ok": True, "schema_version": 2}
         with self.transaction() as db:
             if method == "POST" and path == "/v1/server-sessions":
                 supplied = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else ""
@@ -164,11 +173,15 @@ class Service:
                 return {"closed": True}
             presence_id = data.get("presence_id") if method != "GET" else query.get("presence_id", [None])[0]
             presence = self.presence(db, server, presence_id, now)
+            from publication import dispatch as publication_dispatch
+            published = publication_dispatch(self, db, method, path, query, data, server, presence, now)
+            if published is not None:
+                return published
             match = re.fullmatch(r"/v1/players/(\d+)/bootstrap", path)
             if method == "GET" and match:
                 if int(match[1]) != presence["player_id"]:
                     fail(403, "player_owner", "This player is unavailable")
-                return self.bootstrap(db, presence["player_id"], now)
+                return self.bootstrap(db, presence["player_id"], now, include_drafts=query.get("include_drafts", [None])[0] == "1")
             match = re.fullmatch(r"/v1/slots/([^/]+)/(edit-lease|draft)", path)
             if not match:
                 fail(404, "not_found", "Endpoint unavailable")
@@ -183,7 +196,8 @@ class Service:
                     lid = lease["id"] if lease and lease["server_id"] == server["id"] and lease["presence_id"] == presence["id"] and lease["expires_at"] > now else secrets.token_hex(16)
                     expiry = min(now+180, server["absolute_expiry"])
                     db.execute("INSERT INTO edit_leases VALUES(?,?,?,?,?) ON CONFLICT(slot_id) DO UPDATE SET id=excluded.id,server_id=excluded.server_id,presence_id=excluded.presence_id,expires_at=excluded.expires_at", (slot["id"], lid, server["id"], presence["id"], expiry))
-                    return dict(id=lid, expires_at=expiry)
+                    revision = db.execute("SELECT revision FROM drafts WHERE slot_id=?", (slot["id"],)).fetchone()[0]
+                    return dict(id=lid, expires_at=expiry, draft_revision=revision)
                 if method == "DELETE":
                     if lease and (lease["server_id"] != server["id"] or lease["presence_id"] != presence["id"] or lease["id"] != data.get("lease_id")):
                         fail(403, "lease_binding", "Wrong edit lease")
@@ -191,7 +205,7 @@ class Service:
                     return {"released": True}
             draft = db.execute("SELECT * FROM drafts WHERE slot_id=?", (slot["id"],)).fetchone()
             if match[2] == "draft" and method == "GET":
-                return dict(course_id=slot["course_id"], revision=draft["revision"], layout=json.loads(draft["layout_json"]), content_hash=draft["content_hash"], updated_at=draft["updated_at"])
+                return self.draft_payload(db, slot, draft)
             if match[2] != "draft" or method != "PUT":
                 fail(405, "method_unavailable", "Method unavailable")
             request_id = data.get("request_id")
